@@ -1,150 +1,352 @@
+from __future__ import annotations
+
 import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
 from dms2dec import dec2dms_func
 
-mode = 'labels'    # can be geo, labels or regions
-geo_selection = ['LFST']  # exact match
-regions_selection = ['LFST']    # if string is contained in feature name
-labels_selection = ['LFST']     # if string is contained in feature name
+
+# =========================
+# ⚙️ CONFIGURATION
+# =========================
+MODE = "geo"  # options: "geo", "regions", "labels"
+
+GEO_SELECTION = ["LFMD"]       # exact ICAO match
+REGIONS_SELECTION = ["LFMD"]   # substring match unless REGIONS_EXACT_MATCH = True
+LABELS_SELECTION = ["LFMD"]    # substring match unless LABELS_EXACT_MATCH = True
+
+REGIONS_EXACT_MATCH = False
+LABELS_EXACT_MATCH = False
+
+DEBUG = False
+
+SOURCE_DIR = Path("source")
+OUTPUT_DIR = Path("output")
+
+FIELD_ICAO = "icao"
+FIELD_COLOR = "color"
+FIELD_TEXT_LABEL = "text_label"
 
 
-def geo():
-    with open('source/geo.geojson') as source:
-        geo = json.load(source)
-        for item in geo_selection:
-            output_file = 'output/geo_{}.txt'.format(item).replace(' ', '_')
-            w_edge_cnt = 0
-            line_cnt = 0
-            with open(output_file, 'w') as output:
-                # write first line
-                output.write('[GEO] {}'.format(item))
-                output.write('\n')
-
-                for feature in geo['features']:
-                    pair_list = []
-                    if feature['properties']['name'] == item:  # if selected
-
-                        # fetch coordinates and convert to lists
-                        coordinates = feature['geometry']['coordinates']
-                        if len(coordinates) == 1:
-                            if len(coordinates[0]) > 2:
-                                for i, j in enumerate(coordinates[0][:-1]):
-                                    pair = [j, coordinates[0][i + 1]]
-                                    pair_list.append(pair)
-                                feature['geometry']['coordinates'] = pair_list
-
-                for feature in geo['features']:
-                    # polygon properties
-                    poly_name = feature['properties']['name']
-                    poly_color = feature['properties']['color']
-                    polygon_properties = [poly_color, poly_name]
-                    if feature['properties']['name'] == item:
-
-                        # polygon coordinates
-                        dms_coord = []
-                        for edge in feature['geometry']['coordinates']:
-                            dms_edge = []
-                            for vertex in edge:
-                                dms_vertex = dec2dms_func(vertex)  # turn vertexes into DMS
-                                dms_edge.append(dms_vertex)
-                            dms_coord.append(dms_edge)
-
-                        # format sct strings
-                        for edge in dms_coord:
-                            w_edge_cnt += 1
-                            output.write('{} {} {} {} {}'.format(edge[0][1], edge[0][0], edge[1][1], edge[1][0],
-                                                                 polygon_properties[0]))
-                            output.write('\n')
-
-        print('file saved to: {}'.format(output_file))
-        print('written edges: {}'.format(w_edge_cnt))
+@dataclass
+class ExportStats:
+    target: str
+    output_file: Path
+    matches: int = 0
+    edges: int = 0
+    polygons: int = 0
+    labels: int = 0
+    skipped: int = 0
 
 
-def regions():
-    # init counts
-    vertexcnt = 0
-    poly_cnt = 0
+class Cli:
+    @staticmethod
+    def banner(mode: str, selections: Sequence[str], debug: bool) -> None:
+        joined = ", ".join(selections) if selections else "(none)"
+        print(f"\n🚀 Starting {mode.upper()} export")
+        print(f"🎯 Targets: {joined}")
+        print(f"🐞 Debug mode: {'ON' if debug else 'OFF'}")
+        print("─" * 52)
 
-    # import geojson file
-    with open('source/regions.geojson') as source:
-        regions = json.load(source)
+    @staticmethod
+    def info(message: str) -> None:
+        print(f"ℹ️  {message}")
 
-        for airport in regions_selection:
-            # write to text file
-            output_file = 'output/regions-{}.txt'.format(airport).replace(' ', '_')
-            with open(output_file, 'w') as output:
-                output.write('[REGIONS] {}'.format(airport))
-                output.write('\n')
+    @staticmethod
+    def debug(message: str) -> None:
+        if DEBUG:
+            print(f"🐞 {message}")
 
-                for idx, feature in enumerate(regions['features']):
-                    if airport in feature['properties']['name']:  # only output data for selected airport
-                        coords = feature['geometry']['coordinates']
+    @staticmethod
+    def warning(message: str) -> None:
+        print(f"⚠️  {message}")
 
-                        # Validate the coordinate structure
-                        if not coords or not isinstance(coords[0], list) or not coords[0]:
-                            print(f"⚠️  Skipping feature '{feature['properties']['name']}' at feature index {idx} (approx line ~{idx * 7 + 10}) due to missing or invalid coordinates.")
-                            continue
+    @staticmethod
+    def error(message: str) -> None:
+        print(f"❌ {message}", file=sys.stderr)
 
-                        poly_cnt += 1
-
-                        # creating coordinate list in dms format
-                        dmscoordset = []
-                        for coordinate in coords[0][0]:
-                            vertexcnt += 1
-                            dmscoord = dec2dms_func(coordinate)
-                            dmscoordset.append(dmscoord)
-
-                        # remove repeated first vertex at the end from dmscoordset according to sct spec
-                        if dmscoordset:
-                            del dmscoordset[-1]
-
-                        # output
-                        output.write(feature['properties']['color'])
-                        output.write('\n')
-                        output.write('{} {} ;- {}'.format(dmscoordset[0][1], dmscoordset[0][0],
-                                                          feature['properties']['name']))
-                        output.write('\n')
-
-                        del dmscoordset[0]
-                        for vertex in dmscoordset:
-                            output.write('{} {}'.format(vertex[1], vertex[0]))
-                            output.write('\n')
-
-                print('✅ File saved to: {}'.format(output_file))
-                print('✏️  Written edges: {}'.format(vertexcnt))
-                print('🧩 Polygons: {}'.format(poly_cnt))
+    @staticmethod
+    def success(stats: ExportStats, mode: str) -> None:
+        print(f"\n✅ {mode.upper()} export complete for {stats.target}")
+        print(f"📁 File: {stats.output_file}")
+        print(f"🧭 Matches: {stats.matches}")
+        if stats.polygons:
+            print(f"🧩 Polygons: {stats.polygons}")
+        if stats.edges:
+            print(f"✏️  Edges: {stats.edges}")
+        if stats.labels:
+            print(f"🏷️  Labels: {stats.labels}")
+        if stats.skipped:
+            print(f"⚠️  Skipped: {stats.skipped}")
+        print("✨ Done!\n")
 
 
+def ensure_output_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    Cli.debug(f"Ensured output directory exists: {path.resolve()}")
 
-def labels():
-    with open('source/labels.geojson') as source:
-        labels = json.load(source)
-        for airport in labels_selection:
-            label_cnt = 0
-            # write to text file
-            filename = 'output/labels-{}.txt'.format(airport)
-            outputfile = open(filename, 'w')
-            outputfile.write('[Labels] {}'.format(airport))
-            outputfile.write('\n')
 
-            for feature in labels['features']:
-                if airport in feature['properties']['name']:
-                    # polygon coordinates
-                    vertex = feature['geometry']['coordinates']
-                    dms_vertex = dec2dms_func(vertex)
-                    outputfile.write('{} {} {} {}'.format(dms_vertex[1], dms_vertex[0], 
-                                                          feature['properties']['text_label'], 
-                                                          feature['properties']['color']))
-                    outputfile.write('\n')
-                    label_cnt += 1
+def load_geojson(path: Path) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing source file: {path}")
+    Cli.debug(f"Loading GeoJSON from {path.resolve()}")
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    Cli.debug(f"Loaded {len(data.get('features', []))} features from {path.name}")
+    return data
 
-            print('file saved to: {}'.format(filename))
-            print('labels: {}'.format(label_cnt))
+
+def safe_icao(feature: dict) -> str:
+    return str(feature.get("properties", {}).get(FIELD_ICAO, "")).strip()
+
+
+def safe_color(feature: dict, default: str = "WHITE") -> str:
+    return str(feature.get("properties", {}).get(FIELD_COLOR, default)).strip() or default
+
+
+def safe_text_label(feature: dict, default: str = "") -> str:
+    return str(feature.get("properties", {}).get(FIELD_TEXT_LABEL, default)).strip()
+
+
+def matches_selection(value: str, selection: str, exact: bool) -> bool:
+    return value == selection if exact else selection in value
+
+
+def dec2dms_pair(vertex: Sequence[float]) -> tuple[str, str]:
+    dms_vertex = dec2dms_func(vertex)
+    return dms_vertex[0], dms_vertex[1]
+
+
+def iter_line_segments(ring: Sequence[Sequence[float]]) -> Iterable[list[Sequence[float]]]:
+    if len(ring) < 2:
+        return
+    for index in range(len(ring) - 1):
+        yield [ring[index], ring[index + 1]]
+
+
+def normalize_geo_segments(coordinates: list) -> list[list[Sequence[float]]]:
+    """
+    Normalize polygon coordinates into two-point line segments.
+    Supports common shape: [[[lon, lat], ...]]
+    """
+    if not coordinates:
+        return []
+
+    if len(coordinates) == 1 and isinstance(coordinates[0], list) and coordinates[0]:
+        ring = coordinates[0]
+        if isinstance(ring[0], (list, tuple)) and len(ring[0]) >= 2:
+            return list(iter_line_segments(ring))
+
+    if all(isinstance(edge, list) and len(edge) == 2 for edge in coordinates):
+        return coordinates
+
+    return []
+
+
+def extract_region_vertices(coords: list) -> list[Sequence[float]]:
+    """Return the first polygon ring from a typical MultiPolygon structure."""
+    try:
+        vertices = coords[0][0]
+    except (IndexError, TypeError):
+        return []
+    return vertices if isinstance(vertices, list) else []
+
+
+def export_geo(selections: Sequence[str], source_dir: Path, output_dir: Path) -> list[ExportStats]:
+    geo = load_geojson(source_dir / "geo.geojson")
+    results: list[ExportStats] = []
+
+    for selection in selections:
+        stats = ExportStats(
+            target=selection,
+            output_file=output_dir / f"geo_{selection.replace(' ', '_')}.txt",
+        )
+        Cli.debug(f"Processing GEO selection: {selection}")
+
+        with stats.output_file.open("w", encoding="utf-8") as output:
+            output.write(f"[GEO] {selection}\n")
+
+            for idx, feature in enumerate(geo.get("features", [])):
+                icao = safe_icao(feature)
+                if icao != selection:
+                    continue
+
+                stats.matches += 1
+                color = safe_color(feature)
+                segments = normalize_geo_segments(feature.get("geometry", {}).get("coordinates", []))
+                Cli.debug(f"GEO feature #{idx} '{icao}' yielded {len(segments)} segments")
+
+                if not segments:
+                    stats.skipped += 1
+                    Cli.warning(f"Skipping GEO feature '{icao}' — invalid polygon structure")
+                    continue
+
+                for edge in segments:
+                    start_lon, start_lat = dec2dms_pair(edge[0])
+                    end_lon, end_lat = dec2dms_pair(edge[1])
+                    output.write(f"{start_lat} {start_lon} {end_lat} {end_lon} {color}\n")
+                    stats.edges += 1
+
+        results.append(stats)
+        Cli.success(stats, "geo")
+
+    return results
+
+
+def export_regions(
+    selections: Sequence[str],
+    source_dir: Path,
+    output_dir: Path,
+    exact: bool,
+) -> list[ExportStats]:
+    regions = load_geojson(source_dir / "regions.geojson")
+    results: list[ExportStats] = []
+
+    for selection in selections:
+        stats = ExportStats(
+            target=selection,
+            output_file=output_dir / f"regions-{selection.replace(' ', '_')}.txt",
+        )
+        Cli.debug(f"Processing REGIONS selection: {selection} (exact={exact})")
+
+        with stats.output_file.open("w", encoding="utf-8") as output:
+            output.write(f"[REGIONS] {selection}\n")
+
+            for idx, feature in enumerate(regions.get("features", [])):
+                icao = safe_icao(feature)
+                if not matches_selection(icao, selection, exact=exact):
+                    continue
+
+                vertices = extract_region_vertices(feature.get("geometry", {}).get("coordinates", []))
+                Cli.debug(f"REGION feature #{idx} '{icao}' has {len(vertices)} raw vertices")
+
+                if not vertices:
+                    stats.skipped += 1
+                    Cli.warning(f"Skipping region '{icao}' (feature #{idx}) — invalid coordinates")
+                    continue
+
+                dms_vertices = [dec2dms_pair(vertex) for vertex in vertices]
+                if len(dms_vertices) > 1 and dms_vertices[0] == dms_vertices[-1]:
+                    dms_vertices.pop()
+                    Cli.debug(f"Removed duplicated closing vertex for region '{icao}'")
+
+                if not dms_vertices:
+                    stats.skipped += 1
+                    Cli.warning(f"Skipping region '{icao}' (feature #{idx}) — empty vertex list")
+                    continue
+
+                color = safe_color(feature)
+                output.write(f"{color}\n")
+                first_lon, first_lat = dms_vertices[0]
+                output.write(f"{first_lat} {first_lon} ;- {icao}\n")
+                for lon, lat in dms_vertices[1:]:
+                    output.write(f"{lat} {lon}\n")
+
+                stats.matches += 1
+                stats.polygons += 1
+                stats.edges += len(dms_vertices)
+
+        results.append(stats)
+        Cli.success(stats, "regions")
+
+    return results
+
+
+def export_labels(
+    selections: Sequence[str],
+    source_dir: Path,
+    output_dir: Path,
+    exact: bool,
+) -> list[ExportStats]:
+    labels = load_geojson(source_dir / "labels.geojson")
+    results: list[ExportStats] = []
+
+    for selection in selections:
+        stats = ExportStats(
+            target=selection,
+            output_file=output_dir / f"labels-{selection.replace(' ', '_')}.txt",
+        )
+        Cli.debug(f"Processing LABELS selection: {selection} (exact={exact})")
+
+        with stats.output_file.open("w", encoding="utf-8") as output:
+            output.write(f"[LABELS] {selection}\n")
+
+            for idx, feature in enumerate(labels.get("features", [])):
+                icao = safe_icao(feature)
+                if not matches_selection(icao, selection, exact=exact):
+                    continue
+
+                vertex = feature.get("geometry", {}).get("coordinates")
+                if not isinstance(vertex, (list, tuple)) or len(vertex) < 2:
+                    stats.skipped += 1
+                    Cli.warning(f"Skipping label '{icao}' (feature #{idx}) — invalid point coordinates")
+                    continue
+
+                lon, lat = dec2dms_pair(vertex)
+                text_label = safe_text_label(feature)
+                color = safe_color(feature)
+                output.write(f"{lat} {lon} {text_label} {color}\n")
+
+                stats.matches += 1
+                stats.labels += 1
+                Cli.debug(f"Wrote label '{text_label}' for ICAO '{icao}'")
+
+        results.append(stats)
+        Cli.success(stats, "labels")
+
+    return results
+
+
+def get_active_config() -> tuple[str, list[str], bool]:
+    mode = MODE.lower().strip()
+
+    if mode == "geo":
+        return mode, list(GEO_SELECTION), True
+    if mode == "regions":
+        return mode, list(REGIONS_SELECTION), REGIONS_EXACT_MATCH
+    if mode == "labels":
+        return mode, list(LABELS_SELECTION), LABELS_EXACT_MATCH
+
+    raise ValueError("MODE must be one of: 'geo', 'regions', 'labels'")
+
+
+def main() -> int:
+    try:
+        mode, selections, exact = get_active_config()
+        if not selections:
+            Cli.warning("No selections configured. Nothing to export.")
+            return 0
+
+        ensure_output_dir(OUTPUT_DIR)
+        Cli.banner(mode, selections, DEBUG)
+        Cli.debug(f"Using source directory: {SOURCE_DIR.resolve()}")
+        Cli.debug(f"Using output directory: {OUTPUT_DIR.resolve()}")
+
+        if mode == "geo":
+            export_geo(selections, SOURCE_DIR, OUTPUT_DIR)
+        elif mode == "regions":
+            export_regions(selections, SOURCE_DIR, OUTPUT_DIR, exact=exact)
+        else:
+            export_labels(selections, SOURCE_DIR, OUTPUT_DIR, exact=exact)
+
+    except FileNotFoundError as exc:
+        Cli.error(str(exc))
+        return 1
+    except json.JSONDecodeError as exc:
+        Cli.error(f"Invalid JSON: {exc}")
+        return 1
+    except Exception as exc:
+        Cli.error(f"Unexpected error: {exc}")
+        if DEBUG:
+            raise
+        return 1
+
+    print("🎉 Export finished successfully. Have fun!\n")
+    return 0
 
 
 if __name__ == "__main__":
-    if mode == 'geo':
-        geo()
-    elif mode == 'regions':
-        regions()
-    elif mode == 'labels':
-        labels()
+    raise SystemExit(main())
